@@ -7,6 +7,7 @@ from services import ocr
 from services.ocr import OCRError
 import httpx
 from config import config
+import random
 
 router = APIRouter(prefix="/api", tags=["recognize"])
 logger = logging.getLogger(__name__)
@@ -26,30 +27,26 @@ def create_error_response(e: Exception, detail: str = "处理失败") -> dict:
             error_response["status_code"] = e.status_code
     return error_response
 
-def get_cookie_config(cookie_name: str = None) -> str:
+def get_cookie_config() -> str:
     """
-    根据可选的 cookie_name 参数，从配置中返回对应的 cookie 字符串，
-    如果未提供，则返回第一个配置的 cookie。
+    从配置中随机返回一个 cookie 字符串
     """
     try:
-        if cookie_name:
-            for c in config.cookies:
-                if c.name == cookie_name:
-                    return c.cookie
-            raise HTTPException(status_code=400, detail=f"未找到名称为 {cookie_name} 的 cookie 配置")
-        return config.cookies[0].cookie
+        if not config.cookies:
+            raise HTTPException(status_code=500, detail="未找到任何 cookie 配置")
+        return random.choice(config.cookies).cookie
     except Exception as e:
         logger.error(f"获取cookie配置失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"获取cookie配置失败: {str(e)}")
 
-@router.post("/recognize/url", summary="通过图片 URL 识别")
+@router.post("/recognize/url", )
 async def recognize_url(
-    req: RecognizeUrlRequest, cookie_name: str = Query(None, description="使用的 cookie 配置名称")
+    req: RecognizeUrlRequest
 ):
-    cookie = get_cookie_config(cookie_name)
+    cookie = get_cookie_config()
     token_match = re.search(r"token=([^;]+)", cookie)
     if not token_match:
-        raise HTTPException(status_code=400, detail="Cookie 格式错误：缺少 token 字段")
+        raise HTTPException(status_code=500, detail="Cookie中未找到token")
     token = token_match.group(1)
     
     try:
@@ -68,14 +65,14 @@ async def recognize_url(
             content=create_error_response(e, "服务器内部错误")
         )
 
-@router.post("/recognize/base64", summary="通过 Base64 识别")
+@router.post("/recognize/base64", )
 async def recognize_base64(
-    req: RecognizeBase64Request, cookie_name: str = Query(None, description="使用的 cookie 配置名称")
+    req: RecognizeBase64Request
 ):
-    cookie = get_cookie_config(cookie_name)
+    cookie = get_cookie_config()
     token_match = re.search(r"token=([^;]+)", cookie)
     if not token_match:
-        raise HTTPException(status_code=400, detail="Cookie 格式错误：缺少 token 字段")
+        raise HTTPException(status_code=500, detail="Cookie中未找到token")
     token = token_match.group(1)
     
     try:
@@ -94,14 +91,14 @@ async def recognize_base64(
             content=create_error_response(e, "服务器内部错误")
         )
 
-@router.post("/recognize/file", summary="通过 imageId 识别（文件识别）")
+@router.post("/recognize/file", )
 async def recognize_file(
-    req: RecognizeFileRequest, cookie_name: str = Query(None, description="使用的 cookie 配置名称")
+    req: RecognizeFileRequest
 ):
-    cookie = get_cookie_config(cookie_name)
+    cookie = get_cookie_config()
     token_match = re.search(r"token=([^;]+)", cookie)
     if not token_match:
-        raise HTTPException(status_code=400, detail="Cookie 格式错误：缺少 token 字段")
+        raise HTTPException(status_code=500, detail="Cookie中未找到token")
     token = token_match.group(1)
     
     try:
@@ -122,14 +119,14 @@ async def recognize_file(
             content=create_error_response(e, "服务器内部错误")
         )
 
-@router.post("/upload-proxy", summary="代理上传文件")
-async def proxy_upload(
-    file: UploadFile = File(...), cookie_name: str = Query(None, description="使用的 cookie 配置名称")
+@router.post("/recognize/upload", )
+async def recognize_upload(
+    file: UploadFile = File(...)
 ):
-    cookie = get_cookie_config(cookie_name)
+    cookie = get_cookie_config()
     token_match = re.search(r"token=([^;]+)", cookie)
     if not token_match:
-        raise HTTPException(status_code=400, detail="Cookie 格式错误：缺少 token 字段")
+        raise HTTPException(status_code=500, detail="Cookie中未找到token")
     token = token_match.group(1)
     
     upload_url = f"{config.base_api_url}/api/v1/files/"
