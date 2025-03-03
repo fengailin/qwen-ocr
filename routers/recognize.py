@@ -8,6 +8,7 @@ from services.ocr import OCRError
 import httpx
 from config import config
 import random
+import asyncio
 
 router = APIRouter(prefix="/api", tags=["recognize"])
 logger = logging.getLogger(__name__)
@@ -137,30 +138,54 @@ async def recognize_upload(
     }
     
     try:
-        file_bytes = await file.read()
-        files = {"file": (file.filename, file_bytes, file.content_type)}
+        # 验证文件大小
+        file_size = 0
+        chunk_size = 8192
+        chunks = []
         
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.post(upload_url, headers=headers, files=files)
-                resp.raise_for_status()
-                data = resp.json()
-                logger.debug(f"文件上传成功: {file.filename}")
-                return JSONResponse(content=data)
-            except httpx.HTTPError as e:
-                logger.error(f"文件上传请求失败: {str(e)}")
-                raw_response = None
-                if hasattr(e, 'response') and e.response is not None:
-                    try:
-                        raw_response = e.response.text
-                        logger.error(f"原始响应内容: {raw_response}")
-                    except:
-                        pass
-                raise OCRError(
-                    f"文件上传失败: {str(e)}",
-                    status_code=e.response.status_code if hasattr(e, 'response') else None,
-                    raw_response=raw_response
-                )
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            file_size += len(chunk)
+            chunks.append(chunk)
+            
+            # 如果文件大于10MB，提前终止
+            if file_size > 10 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="文件大小超过限制(10MB)")
+        
+        file_bytes = b''.join(chunks)
+        
+        # 验证文件类型
+        content_type = file.content_type
+        if not content_type.startswith('image/'):
+            raise HTTPException(status_code=415, detail="仅支持图片文件上传")
+            
+        files = {"file": (file.filename, file_bytes, content_type)}
+        
+        # 使用信号量限制并发请求数
+        async with asyncio.Semaphore(5):  # 最多5个并发请求
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                try:
+                    resp = await client.post(upload_url, headers=headers, files=files)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    logger.debug(f"文件上传成功: {file.filename}")
+                    return JSONResponse(content=data)
+                except httpx.HTTPError as e:
+                    logger.error(f"文件上传请求失败: {str(e)}")
+                    raw_response = None
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            raw_response = e.response.text
+                            logger.error(f"原始响应内容: {raw_response}")
+                        except:
+                            pass
+                    raise OCRError(
+                        f"文件上传失败: {str(e)}",
+                        status_code=e.response.status_code if hasattr(e, 'response') else None,
+                        raw_response=raw_response
+                    )
     except OCRError as e:
         logger.error(f"文件上传失败: {str(e)}")
         return JSONResponse(

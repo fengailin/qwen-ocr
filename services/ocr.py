@@ -90,24 +90,45 @@ async def _upload_image_info(image_bytes: bytes, filename: str, token: str, cook
         "connection": "keep-alive"
     }
     
+    # 根据文件扩展名确定content_type
+    content_type = "application/octet-stream"
+    if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp')):
+        ext = filename.lower().split('.')[-1]
+        content_type = f"image/{ext if ext != 'jpg' else 'jpeg'}"
+    
     files = {
         "file": (
             filename,
             image_bytes,
-            "image/png" if filename.endswith(".png") else "application/octet-stream"
+            content_type
         )
     }
     
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(upload_url, headers=headers, files=files)
-        resp.raise_for_status()
-        file_info = resp.json()
-        logger.debug(f"文件上传响应: {file_info}")
-        
-        if not file_info.get("id"):
-            raise OCRError("文件上传成功，但未返回有效 id", raw_response=resp.text)
-            
-        return file_info
+    # 设置更长的超时时间和重试次数
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for attempt in range(3):  # 最多重试3次
+            try:
+                resp = await client.post(upload_url, headers=headers, files=files)
+                resp.raise_for_status()
+                file_info = resp.json()
+                logger.debug(f"文件上传响应: {file_info}")
+                
+                if not file_info.get("id"):
+                    raise OCRError("文件上传成功，但未返回有效 id", raw_response=resp.text)
+                    
+                return file_info
+            except httpx.HTTPError as e:
+                logger.warning(f"第{attempt + 1}次上传尝试失败: {str(e)}")
+                if attempt == 2:  # 最后一次尝试失败
+                    raise OCRError(
+                        f"文件上传失败: {str(e)}",
+                        status_code=e.response.status_code if hasattr(e, 'response') else None,
+                        raw_response=e.response.text if hasattr(e, 'response') else None
+                    )
+                await asyncio.sleep(1)  # 等待1秒后重试
+            except Exception as e:
+                logger.error(f"文件上传过程发生未知错误: {str(e)}")
+                raise OCRError(f"文件上传失败: {str(e)}")
 
 async def upload_image_info(image_bytes: bytes, filename: str, token: str, cookie: str) -> dict:
     """
