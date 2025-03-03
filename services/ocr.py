@@ -6,7 +6,8 @@ import httpx
 from config import config
 import logging
 import json
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, Callable, TypeVar, Awaitable
+import asyncio
 
 # 设置日志级别为 DEBUG
 logger = logging.getLogger(__name__)
@@ -44,7 +45,33 @@ class OCRError(Exception):
         self.status_code = status_code
         self.raw_response = raw_response
 
-async def upload_image_info(image_bytes: bytes, filename: str, token: str, cookie: str) -> dict:
+# 定义泛型类型变量
+T = TypeVar('T')
+
+async def retry_operation(operation: Callable[..., Awaitable[T]], *args, max_retries: int = 3, delay: float = 1.0, **kwargs) -> T:
+    """
+    通用的异步重试函数
+    :param operation: 要重试的异步操作
+    :param args: 位置参数
+    :param max_retries: 最大重试次数
+    :param delay: 重试间隔（秒）
+    :param kwargs: 关键字参数
+    :return: 操作结果
+    """
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            return await operation(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"第{attempt + 1}次尝试失败: {str(e)}")
+            if attempt < max_retries - 1:  # 如果不是最后一次尝试
+                await asyncio.sleep(delay * (attempt + 1))  # 指数退避
+            continue
+    logger.error(f"在{max_retries}次尝试后仍然失败")
+    raise last_exception
+
+async def _upload_image_info(image_bytes: bytes, filename: str, token: str, cookie: str) -> dict:
     """
     上传图片到 QwenLM，返回完整的文件信息（file_info）。
     """
@@ -63,7 +90,6 @@ async def upload_image_info(image_bytes: bytes, filename: str, token: str, cooki
         "connection": "keep-alive"
     }
     
-    # 使用multipart/form-data格式
     files = {
         "file": (
             filename,
@@ -73,38 +99,23 @@ async def upload_image_info(image_bytes: bytes, filename: str, token: str, cooki
     }
     
     async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post(upload_url, headers=headers, files=files)
-            resp.raise_for_status()
-            file_info = resp.json()
-            logger.debug(f"文件上传响应: {file_info}")
+        resp = await client.post(upload_url, headers=headers, files=files)
+        resp.raise_for_status()
+        file_info = resp.json()
+        logger.debug(f"文件上传响应: {file_info}")
+        
+        if not file_info.get("id"):
+            raise OCRError("文件上传成功，但未返回有效 id", raw_response=resp.text)
             
-            if not file_info.get("id"):
-                raise OCRError("文件上传成功，但未返回有效 id", raw_response=resp.text)
-                
-            return file_info
-        except httpx.HTTPError as e:
-            logger.error(f"文件上传请求失败: {str(e)}")
-            raw_response = None
-            if hasattr(e, 'response') and e.response is not None:
-                try:
-                    raw_response = e.response.text
-                    logger.error(f"原始响应内容: {raw_response}")
-                except:
-                    pass
-            raise OCRError(
-                f"文件上传失败: {str(e)}",
-                status_code=e.response.status_code if hasattr(e, 'response') else None,
-                raw_response=raw_response
-            )
-        except json.JSONDecodeError as e:
-            logger.error(f"响应解析失败: {str(e)}")
-            raise OCRError(f"响应解析失败: {str(e)}", raw_response=e.doc)
-        except Exception as e:
-            logger.error(f"文件上传过程发生未知错误: {str(e)}", exc_info=True)
-            raise OCRError(f"文件上传失败: {str(e)}")
+        return file_info
 
-async def create_chat(token: str, cookie: str, file_info: dict, prompt: str) -> dict:
+async def upload_image_info(image_bytes: bytes, filename: str, token: str, cookie: str) -> dict:
+    """
+    带重试的上传图片函数
+    """
+    return await retry_operation(_upload_image_info, image_bytes, filename, token, cookie)
+
+async def _create_chat(token: str, cookie: str, file_info: dict, prompt: str) -> dict:
     """
     调用 /api/v1/chats/new 接口创建新对话。新建对话时，
     用户消息中附带提示词和上传的图片文件信息（files 字段），
@@ -256,6 +267,12 @@ async def create_chat(token: str, cookie: str, file_info: dict, prompt: str) -> 
             logger.error(f"创建对话过程发生未知错误: {str(e)}", exc_info=True)
             raise OCRError(f"创建对话失败: {str(e)}")
 
+async def create_chat(token: str, cookie: str, file_info: dict, prompt: str) -> dict:
+    """
+    带重试的创建对话函数
+    """
+    return await retry_operation(_create_chat, token, cookie, file_info, prompt)
+
 async def create_file_info_from_id(file_id: str) -> dict:
     """
     根据文件ID创建标准的文件信息对象
@@ -275,19 +292,9 @@ async def create_file_info_from_id(file_id: str) -> dict:
         "updated_at": int(time.time())
     }
 
-async def recognize_image(token: str, cookie: str, file_info: Union[str, dict], prompt: str = DEFAULT_PROMPT) -> dict:
+async def _recognize_image(token: str, cookie: str, file_info: Union[str, dict], prompt: str = DEFAULT_PROMPT) -> dict:
     """
-    优化后的流程：
-    1) 调用 new 接口创建对话，新建对话中附带提示词和图片文件信息；
-    2) 使用返回的 session_id、chat_id 和 assistant 消息 id 调用 completion 接口，
-       提交一条文本 + 图片消息的用户消息，完成识别操作。
-    3) 使用流式传输接收响应，等待完整结果。
-       
-    Args:
-        token: 认证token
-        cookie: cookie字符串
-        file_info: 文件信息，可以是文件ID字符串或完整的文件信息字典
-        prompt: 识别提示
+    图片识别的核心实现
     """
     logger.debug(f"开始识别图片，file_info: {file_info}, prompt: {prompt}")
     
@@ -440,7 +447,13 @@ async def recognize_image(token: str, cookie: str, file_info: Union[str, dict], 
         logger.error(f"识别过程发生未知错误: {str(e)}", exc_info=True)
         raise OCRError(f"识别过程发生错误: {str(e)}")
 
-async def process_image_url(image_url: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
+async def recognize_image(token: str, cookie: str, file_info: Union[str, dict], prompt: str = DEFAULT_PROMPT) -> dict:
+    """
+    带重试的图片识别函数
+    """
+    return await retry_operation(_recognize_image, token, cookie, file_info, prompt)
+
+async def _process_image_url(image_url: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
     """
     根据图片 URL 下载图片后上传，然后调用上面的 recognize_image 流程完成识别。
     
@@ -499,21 +512,15 @@ async def process_image_url(image_url: str, token: str, cookie: str, prompt: str
         logger.error(f"处理过程发生未知错误: {str(e)}", exc_info=True)
         raise OCRError(f"处理过程发生错误: {str(e)}")
 
-async def process_base64_image(base64_image: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
+async def process_image_url(image_url: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
     """
-    根据 Base64 图片数据上传后，再调用上面的 recognize_image 流程完成识别。
-    
-    Args:
-        base64_image: Base64编码的图片数据
-        token: 认证token
-        cookie: cookie字符串
-        prompt: 识别提示
-        
-    Returns:
-        dict: 识别结果
-        
-    Raises:
-        OCRError: 当发生错误时抛出，包含详细错误信息
+    带重试的URL图片处理函数
+    """
+    return await retry_operation(_process_image_url, image_url, token, cookie, prompt)
+
+async def _process_base64_image(base64_image: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
+    """
+    Base64图片处理的核心实现
     """
     logger.info("开始处理Base64图片")
     
@@ -548,3 +555,9 @@ async def process_base64_image(base64_image: str, token: str, cookie: str, promp
     except Exception as e:
         logger.error(f"处理Base64图片时发生未知错误: {str(e)}", exc_info=True)
         raise OCRError(f"处理Base64图片失败: {str(e)}")
+
+async def process_base64_image(base64_image: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
+    """
+    带重试的Base64图片处理函数
+    """
+    return await retry_operation(_process_base64_image, base64_image, token, cookie, prompt)
