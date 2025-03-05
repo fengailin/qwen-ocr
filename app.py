@@ -1,7 +1,7 @@
 import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from routers import recognize
+from routers import recognize, pdf_ocr
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -37,3 +37,5 @@ async def root():
 
 # 将 recognize 路由挂载到 /api 路径下
 app.include_router(recognize.router)
+# 将 PDF OCR 路由挂载到 /api 路径下
+app.include_router(pdf_ocr.router)
