@@ -6,9 +6,11 @@ from models.schemas import RecognizeUrlRequest, RecognizeBase64Request, Recogniz
 from services import ocr
 from services.ocr import OCRError
 import httpx
-from config import config
 import random
 import asyncio
+from pydantic import BaseModel
+from typing import Optional, Dict, Any, Union
+from services.config_manager import ConfigManager
 
 router = APIRouter(prefix="/api", tags=["recognize"])
 logger = logging.getLogger(__name__)
@@ -33,25 +35,21 @@ def get_cookie_config() -> str:
     从配置中随机返回一个 cookie 字符串
     """
     try:
-        if not config.cookies:
-            raise HTTPException(status_code=500, detail="未找到任何 cookie 配置")
-        return random.choice(config.cookies).cookie
+        config_manager = ConfigManager.get_instance()
+        accounts = config_manager.accounts
+        if not accounts:
+            raise HTTPException(status_code=500, detail="未找到任何账号配置")
+        return random.choice(accounts)['cookie']
     except Exception as e:
         logger.error(f"获取cookie配置失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"获取cookie配置失败: {str(e)}")
 
-@router.post("/recognize/url", )
-async def recognize_url(
-    req: RecognizeUrlRequest
-):
+@router.post("/recognize/url")
+async def recognize_url(req: RecognizeUrlRequest):
     cookie = get_cookie_config()
-    token_match = re.search(r"token=([^;]+)", cookie)
-    if not token_match:
-        raise HTTPException(status_code=500, detail="Cookie中未找到token")
-    token = token_match.group(1)
     
     try:
-        result = await ocr.process_image_url(req.imageUrl, token, cookie)
+        result = await ocr.process_image_url(req.imageUrl, cookie)
         return JSONResponse(content=result)
     except OCRError as e:
         logger.error(f"OCR处理失败: {str(e)}")
@@ -66,18 +64,12 @@ async def recognize_url(
             content=create_error_response(e, "服务器内部错误")
         )
 
-@router.post("/recognize/base64", )
-async def recognize_base64(
-    req: RecognizeBase64Request
-):
+@router.post("/recognize/base64")
+async def recognize_base64(req: RecognizeBase64Request):
     cookie = get_cookie_config()
-    token_match = re.search(r"token=([^;]+)", cookie)
-    if not token_match:
-        raise HTTPException(status_code=500, detail="Cookie中未找到token")
-    token = token_match.group(1)
     
     try:
-        result = await ocr.process_base64_image(req.base64Image, token, cookie)
+        result = await ocr.process_base64_image(req.base64Image, cookie)
         return JSONResponse(content=result)
     except OCRError as e:
         logger.error(f"Base64图片处理失败: {str(e)}")
@@ -92,19 +84,13 @@ async def recognize_base64(
             content=create_error_response(e, "服务器内部错误")
         )
 
-@router.post("/recognize/file", )
-async def recognize_file(
-    req: RecognizeFileRequest
-):
+@router.post("/recognize/file")
+async def recognize_file(req: RecognizeFileRequest):
     cookie = get_cookie_config()
-    token_match = re.search(r"token=([^;]+)", cookie)
-    if not token_match:
-        raise HTTPException(status_code=500, detail="Cookie中未找到token")
-    token = token_match.group(1)
     
     try:
         logger.debug(f"开始处理文件识别请求，imageId: {req.imageId}")
-        result = await ocr.recognize_image(token, cookie, req.imageId)
+        result = await ocr.recognize_image(cookie, req.imageId)
         logger.debug(f"文件识别结果: {result}")
         return JSONResponse(content=result)
     except OCRError as e:
@@ -120,22 +106,10 @@ async def recognize_file(
             content=create_error_response(e, "服务器内部错误")
         )
 
-@router.post("/recognize/upload", )
-async def recognize_upload(
-    file: UploadFile = File(...)
-):
+@router.post("/recognize/upload")
+async def recognize_upload(file: UploadFile = File(...)):
     cookie = get_cookie_config()
-    token_match = re.search(r"token=([^;]+)", cookie)
-    if not token_match:
-        raise HTTPException(status_code=500, detail="Cookie中未找到token")
-    token = token_match.group(1)
-    
-    upload_url = f"{config.base_api_url}/api/v1/files/"
-    headers = {
-        "accept": "application/json",
-        "authorization": f"Bearer{token}",
-        "cookie": cookie,
-    }
+    config_manager = ConfigManager.get_instance()
     
     try:
         # 验证文件大小
@@ -161,31 +135,11 @@ async def recognize_upload(
         if not content_type.startswith('image/'):
             raise HTTPException(status_code=415, detail="仅支持图片文件上传")
             
-        files = {"file": (file.filename, file_bytes, content_type)}
-        
-        # 使用信号量限制并发请求数
-        async with asyncio.Semaphore(5):  # 最多5个并发请求
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                try:
-                    resp = await client.post(upload_url, headers=headers, files=files)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    logger.debug(f"文件上传成功: {file.filename}")
-                    return JSONResponse(content=data)
-                except httpx.HTTPError as e:
-                    logger.error(f"文件上传请求失败: {str(e)}")
-                    raw_response = None
-                    if hasattr(e, 'response') and e.response is not None:
-                        try:
-                            raw_response = e.response.text
-                            logger.error(f"原始响应内容: {raw_response}")
-                        except:
-                            pass
-                    raise OCRError(
-                        f"文件上传失败: {str(e)}",
-                        status_code=e.response.status_code if hasattr(e, 'response') else None,
-                        raw_response=raw_response
-                    )
+        # 使用OCR服务的上传功能
+        result = await ocr.upload_image_info(file_bytes, file.filename, cookie)
+        logger.debug(f"文件上传成功: {file.filename}")
+        return JSONResponse(content=result)
+            
     except OCRError as e:
         logger.error(f"文件上传失败: {str(e)}")
         return JSONResponse(

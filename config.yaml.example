@@ -1,0 +1,12 @@
+base_api_url: "https://chat.qwen.ai"
+accounts:
+  - username: "example@email.com"
+    password: "your_password_hash"  # 密码的SHA-256哈希值
+    cookie: "your_cookie_string"
+    token: "your_jwt_token"
+    expires_at: 1744183758  # token过期时间戳
+  - username: "another@email.com"
+    password: "another_password_hash"
+    cookie: "another_cookie_string"
+    token: "another_jwt_token"
+    expires_at: 1744183999 

@@ -1,6 +1,5 @@
 import uvicorn
 import argparse
-from config import config
 
 def main():
     """

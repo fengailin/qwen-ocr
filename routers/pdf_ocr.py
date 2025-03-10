@@ -1,4 +1,4 @@
-from fastapi import APIRouter, BackgroundTasks, UploadFile, HTTPException
+from fastapi import APIRouter, BackgroundTasks, UploadFile, HTTPException, File
 from typing import List, Dict, Any
 import asyncio
 import json
@@ -10,10 +10,11 @@ import zipfile
 import io
 import aiofiles
 from services.ocr import recognize_image, upload_image_info
-from config import config
 import random
 import logging
 from fastapi.responses import PlainTextResponse
+from services.ocr import process_base64_image, OCRError
+from services.config_manager import ConfigManager
 
 router = APIRouter(prefix="/api", tags=["pdf_ocr"])
 logger = logging.getLogger(__name__)
@@ -28,16 +29,16 @@ DATA_DIR = "data"
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-def get_cookie_config() -> tuple[str, str]:
-    """从配置中随机返回一个 cookie 字符串和对应的token"""
+def get_cookie_config() -> str:
+    """
+    从配置中随机返回一个 cookie 字符串
+    """
     try:
-        if not config.cookies:
-            raise HTTPException(status_code=500, detail="未找到任何 cookie 配置")
-        cookie = random.choice(config.cookies).cookie
-        token_match = re.search(r"token=([^;]+)", cookie)
-        if not token_match:
-            raise HTTPException(status_code=500, detail="Cookie中未找到token")
-        return cookie, token_match.group(1)
+        config_manager = ConfigManager.get_instance()
+        accounts = config_manager.accounts
+        if not accounts:
+            raise HTTPException(status_code=500, detail="未找到任何账号配置")
+        return random.choice(accounts)['cookie']
     except Exception as e:
         logger.error(f"获取cookie配置失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"获取cookie配置失败: {str(e)}")
@@ -118,13 +119,13 @@ async def process_images(zip_bytes: bytes, task_id: str):
                         img_data = zip_file.read(img_name)
                         
                         # 获取cookie和token
-                        cookie, token = get_cookie_config()
+                        cookie = get_cookie_config()
                         
                         # 先上传图片
                         file_info = await upload_image_info(
                             image_bytes=img_data,
                             filename=os.path.basename(img_name),
-                            token=token,
+                            token=cookie,
                             cookie=cookie
                         )
                         
@@ -135,7 +136,7 @@ async def process_images(zip_bytes: bytes, task_id: str):
                             content_buffer = []
                             
                             result = await recognize_image(
-                                token=token,
+                                token=cookie,
                                 cookie=cookie,
                                 file_info=file_info,
                                 

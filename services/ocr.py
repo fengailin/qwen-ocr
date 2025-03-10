@@ -3,11 +3,12 @@ import time
 import uuid
 import base64
 import httpx
-from config import config
 import logging
 import json
 from typing import Optional, Dict, Any, Union, Callable, TypeVar, Awaitable
 import asyncio
+from .auth import check_token_validity, extract_token_from_cookie, signin
+from .config_manager import ConfigManager
 
 # 设置日志级别为 DEBUG
 logger = logging.getLogger(__name__)
@@ -71,11 +72,49 @@ async def retry_operation(operation: Callable[..., Awaitable[T]], *args, max_ret
     logger.error(f"在{max_retries}次尝试后仍然失败")
     raise last_exception
 
-async def _upload_image_info(image_bytes: bytes, filename: str, token: str, cookie: str) -> dict:
+async def _get_valid_token(cookie: str) -> str:
+    """
+    从cookie中获取有效的token，如果token无效或不存在则尝试重新登录
+    
+    Args:
+        cookie: cookie字符串
+        
+    Returns:
+        str: 有效的token
+    """
+    config_manager = ConfigManager.get_instance()
+    
+    # 从配置中获取账号信息
+    account = config_manager.get_account_by_cookie(cookie)
+    if not account:
+        raise OCRError("无法找到对应的账号信息")
+    
+    # 检查现有token是否有效
+    token = account.get('token')
+    if token and await check_token_validity(token):
+        return token
+        
+    # 如果token无效或不存在，尝试重新登录
+    try:
+        username = account.get('username')
+        password = account.get('password')
+        if not username or not password:
+            raise OCRError("账号信息不完整，无法重新登录")
+            
+        new_token, new_cookie, expires_at = await signin(username, password)
+        return new_token
+    except Exception as e:
+        raise OCRError(f"获取新token失败: {str(e)}")
+
+async def _upload_image_info(image_bytes: bytes, filename: str, cookie: str) -> dict:
     """
     上传图片到 QwenLM，返回完整的文件信息（file_info）。
     """
-    upload_url = f"{config.base_api_url}/api/v1/files/"
+    # 获取有效的token和配置管理器
+    token = await _get_valid_token(cookie)
+    config_manager = ConfigManager.get_instance()
+    
+    upload_url = f"{config_manager.base_api_url}/api/v1/files/"
     headers = {
         "accept": "application/json",
         "accept-language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
@@ -130,19 +169,23 @@ async def _upload_image_info(image_bytes: bytes, filename: str, token: str, cook
                 logger.error(f"文件上传过程发生未知错误: {str(e)}")
                 raise OCRError(f"文件上传失败: {str(e)}")
 
-async def upload_image_info(image_bytes: bytes, filename: str, token: str, cookie: str) -> dict:
+async def upload_image_info(image_bytes: bytes, filename: str, cookie: str) -> dict:
     """
     带重试的上传图片函数
     """
-    return await retry_operation(_upload_image_info, image_bytes, filename, token, cookie)
+    return await retry_operation(_upload_image_info, image_bytes, filename, cookie)
 
-async def _create_chat(token: str, cookie: str, file_info: dict, prompt: str) -> dict:
+async def _create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
     """
     调用 /api/v1/chats/new 接口创建新对话。新建对话时，
     用户消息中附带提示词和上传的图片文件信息（files 字段），
     返回包含 session_id、chat_id 和 assistant 消息 id 的字典。
     """
-    new_chat_url = f"{config.base_api_url}/api/v1/chats/new"
+    # 获取有效的token和配置管理器
+    token = await _get_valid_token(cookie)
+    config_manager = ConfigManager.get_instance()
+    
+    new_chat_url = f"{config_manager.base_api_url}/api/v1/chats/new"
     user_msg_id = str(uuid.uuid4())
     assistant_msg_id = str(uuid.uuid4())
     ts = int(time.time())
@@ -288,11 +331,11 @@ async def _create_chat(token: str, cookie: str, file_info: dict, prompt: str) ->
             logger.error(f"创建对话过程发生未知错误: {str(e)}", exc_info=True)
             raise OCRError(f"创建对话失败: {str(e)}")
 
-async def create_chat(token: str, cookie: str, file_info: dict, prompt: str) -> dict:
+async def create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
     """
     带重试的创建对话函数
     """
-    return await retry_operation(_create_chat, token, cookie, file_info, prompt)
+    return await retry_operation(_create_chat, cookie, file_info, prompt)
 
 async def create_file_info_from_id(file_id: str) -> dict:
     """
@@ -313,7 +356,7 @@ async def create_file_info_from_id(file_id: str) -> dict:
         "updated_at": int(time.time())
     }
 
-async def _recognize_image(token: str, cookie: str, file_info: Union[str, dict], prompt: str = DEFAULT_PROMPT) -> dict:
+async def _recognize_image(cookie: str, file_info: Union[str, dict], prompt: str = DEFAULT_PROMPT) -> dict:
     """
     图片识别的核心实现
     """
@@ -327,14 +370,15 @@ async def _recognize_image(token: str, cookie: str, file_info: Union[str, dict],
     try:
         # 第一步：新建对话
         logger.debug("开始创建对话...")
-        chat_data = await create_chat(token, cookie, file_info, prompt)
+        chat_data = await create_chat(cookie, file_info, prompt)
         session_id = chat_data["session_id"]
         chat_id = chat_data["chat_id"]
         assistant_msg_id = chat_data["assistant_msg_id"]
         logger.debug(f"对话创建成功，session_id: {session_id}, chat_id: {chat_id}")
 
         # 第二步：调用 completions 接口
-        recognition_url = f"{config.base_api_url}/api/chat/completions"
+        config_manager = ConfigManager.get_instance()
+        recognition_url = f"{config_manager.base_api_url}/api/chat/completions"
         payload = {
             "stream": True,
             "incremental_output": True,
@@ -362,6 +406,9 @@ async def _recognize_image(token: str, cookie: str, file_info: Union[str, dict],
             "chat_id": chat_id,
             "id": assistant_msg_id
         }
+        
+        # 获取有效的token
+        token = await _get_valid_token(cookie)
         
         headers = {
             "Content-Type": "application/json",
@@ -468,19 +515,18 @@ async def _recognize_image(token: str, cookie: str, file_info: Union[str, dict],
         logger.error(f"识别过程发生未知错误: {str(e)}", exc_info=True)
         raise OCRError(f"识别过程发生错误: {str(e)}")
 
-async def recognize_image(token: str, cookie: str, file_info: Union[str, dict], prompt: str = DEFAULT_PROMPT) -> dict:
+async def recognize_image(cookie: str, file_info: Union[str, dict], prompt: str = DEFAULT_PROMPT) -> dict:
     """
     带重试的图片识别函数
     """
-    return await retry_operation(_recognize_image, token, cookie, file_info, prompt)
+    return await retry_operation(_recognize_image, cookie, file_info, prompt)
 
-async def _process_image_url(image_url: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
+async def _process_image_url(image_url: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
     """
     根据图片 URL 下载图片后上传，然后调用上面的 recognize_image 流程完成识别。
     
     Args:
         image_url: 图片URL
-        token: 认证token
         cookie: cookie字符串
         prompt: 识别提示
         
@@ -500,11 +546,11 @@ async def _process_image_url(image_url: str, token: str, cookie: str, prompt: st
             image_bytes = resp.content
             logger.debug(f"图片下载成功，大小: {len(image_bytes)} bytes")
 
-        file_info = await upload_image_info(image_bytes, "image", token, cookie)
+        file_info = await upload_image_info(image_bytes, "image", cookie)
         logger.debug(f"图片上传成功，file_info: {file_info}")
         
         try:
-            result = await recognize_image(token, cookie, file_info, prompt)
+            result = await recognize_image(cookie, file_info, prompt)
             logger.info(f"图片识别成功: {result}")
             return result
         except httpx.HTTPError as e:
@@ -533,13 +579,13 @@ async def _process_image_url(image_url: str, token: str, cookie: str, prompt: st
         logger.error(f"处理过程发生未知错误: {str(e)}", exc_info=True)
         raise OCRError(f"处理过程发生错误: {str(e)}")
 
-async def process_image_url(image_url: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
+async def process_image_url(image_url: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
     """
     带重试的URL图片处理函数
     """
-    return await retry_operation(_process_image_url, image_url, token, cookie, prompt)
+    return await retry_operation(_process_image_url, image_url, cookie, prompt)
 
-async def _process_base64_image(base64_image: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
+async def _process_base64_image(base64_image: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
     """
     Base64图片处理的核心实现
     """
@@ -557,14 +603,14 @@ async def _process_base64_image(base64_image: str, token: str, cookie: str, prom
             raise OCRError(f"无效的Base64图片数据: {str(e)}")
 
         try:
-            file_info = await upload_image_info(image_bytes, "image.png", token, cookie)
+            file_info = await upload_image_info(image_bytes, "image.png", cookie)
             logger.debug(f"Base64图片上传成功，file_info: {file_info}")
         except Exception as e:
             logger.error(f"Base64图片上传失败: {str(e)}")
             raise OCRError(f"图片上传失败: {str(e)}")
 
         try:
-            result = await recognize_image(token, cookie, file_info, prompt)
+            result = await recognize_image(cookie, file_info, prompt)
             logger.info("Base64图片识别成功")
             return result
         except Exception as e:
@@ -577,8 +623,8 @@ async def _process_base64_image(base64_image: str, token: str, cookie: str, prom
         logger.error(f"处理Base64图片时发生未知错误: {str(e)}", exc_info=True)
         raise OCRError(f"处理Base64图片失败: {str(e)}")
 
-async def process_base64_image(base64_image: str, token: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
+async def process_base64_image(base64_image: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
     """
     带重试的Base64图片处理函数
     """
-    return await retry_operation(_process_base64_image, base64_image, token, cookie, prompt)
+    return await retry_operation(_process_base64_image, base64_image, cookie, prompt)
