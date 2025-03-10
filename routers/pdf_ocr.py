@@ -108,8 +108,8 @@ async def process_images(zip_bytes: bytes, task_id: str):
                 raise ValueError("ZIP文件中没有找到图片文件")
 
             # 创建信号量来限制并发数
-            upload_semaphore = asyncio.Semaphore(5)  # 限制5个并发上传
-            chat_semaphore = asyncio.Semaphore(5)    # 限制5个并发聊天
+            upload_semaphore = asyncio.Semaphore(10)  # 限制5个并发上传
+            chat_semaphore = asyncio.Semaphore(10)    # 限制5个并发聊天
 
             async def process_single_image(img_name: str, index: int):
                 async with upload_semaphore:
