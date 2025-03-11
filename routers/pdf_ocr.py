@@ -31,14 +31,15 @@ if not os.path.exists(DATA_DIR):
 
 def get_cookie_config() -> str:
     """
-    从配置中随机返回一个 cookie 字符串
+    从配置中随机返回一个包含公共字段的完整 cookie 字符串
     """
     try:
         config_manager = ConfigManager.get_instance()
         accounts = config_manager.accounts
         if not accounts:
             raise HTTPException(status_code=500, detail="未找到任何账号配置")
-        return random.choice(accounts)['cookie']
+        account = random.choice(accounts)
+        return config_manager.get_cookie_with_common_fields(account['cookie'])
     except Exception as e:
         logger.error(f"获取cookie配置失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"获取cookie配置失败: {str(e)}")

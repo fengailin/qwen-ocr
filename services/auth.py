@@ -60,32 +60,53 @@ async def signin(username: str, password: str, is_password_hashed: bool = False)
         logger.debug("已对密码进行SHA256加密")
     
     config_manager = ConfigManager.get_instance()
-    signin_url = f"{config_manager.base_api_url}/api/v1/auths/signin"
+    base_url = config_manager.base_api_url
     
+    # 先访问主页获取初始cookie
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
         "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Content-Type": "application/json",
-        "accept-language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
-        "referer": "https://chat.qwen.ai/auth?action=signin",
-        "bx-v": "2.5.28",
-        "origin": "https://chat.qwen.ai",
-        "dnt": "1",
-        "sec-gpc": "1",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "priority": "u=0",
-        "te": "trailers"
+        "DNT": "1",
+        "Sec-GPC": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1"
     }
     
     try:
-        logger.debug(f"准备发送登录请求到 {signin_url}")
-        async with httpx.AsyncClient(timeout=30.0) as client:  # 设置30秒超时
-            logger.debug("开始发送登录请求...")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            logger.debug("开始请求主页获取初始cookie...")
+            home_response = await client.get(base_url, headers=headers, follow_redirects=True)
+            home_response.raise_for_status()
+            initial_cookies = home_response.headers.get("set-cookie", "")
+            logger.debug(f"获取到初始cookie: {initial_cookies}")
+            
+            # 准备登录请求
+            signin_url = f"{base_url}/api/v1/auths/signin"
+            signin_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
+                "Accept": "application/json",
+                "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Content-Type": "application/json",
+                "Origin": base_url,
+                "Referer": f"{base_url}/auth?action=signin",
+                "Cookie": config_manager.get_cookie_with_common_fields(initial_cookies),
+                "bx-v": "2.5.28",
+                "DNT": "1",
+                "Sec-GPC": "1",
+                "Connection": "keep-alive"
+            }
+            
+            logger.debug(f"准备发送登录请求到 {signin_url}")
             response = await client.post(
                 signin_url,
-                headers=headers,
+                headers=signin_headers,
                 json={
                     "email": username,
                     "password": password
@@ -115,11 +136,19 @@ async def signin(username: str, password: str, is_password_hashed: bool = False)
                 await config_manager.disable_account(username)
                 raise AuthError("响应中没有token", raw_response=response.text)
                 
-            cookies = response.headers.get("set-cookie")
-            if not cookies:
-                logger.error("响应中未找到cookie")
+            # 合并初始cookie、登录返回的cookie和公共cookie
+            login_cookies = response.headers.get("set-cookie", "")
+            all_cookies = initial_cookies
+            if login_cookies:
+                all_cookies = f"{initial_cookies}; {login_cookies}"
+            
+            # 添加公共cookie字段
+            all_cookies = config_manager.get_cookie_with_common_fields(all_cookies)
+            
+            if not all_cookies:
+                logger.error("未获取到任何cookie")
                 await config_manager.disable_account(username)
-                raise AuthError("响应中没有cookie", raw_response=response.text)
+                raise AuthError("未获取到cookie", raw_response=response.text)
                 
             logger.debug("获取token过期时间...")
             expires_at = data.get("expires_at")
@@ -135,11 +164,11 @@ async def signin(username: str, password: str, is_password_hashed: bool = False)
                     logger.debug(f"使用默认过期时间: {expires_at}")
             
             logger.debug("更新配置...")
-            await config_manager.update_account(username, token, cookies, expires_at, enabled=True)
+            await config_manager.update_account(username, token, all_cookies, expires_at, enabled=True)
             
             end_time = time.time()
             logger.info(f"登录成功 - 用户名: {username}, 耗时: {end_time - start_time:.2f}秒")
-            return token, cookies, expires_at
+            return token, all_cookies, expires_at
             
     except httpx.RequestError as e:
         logger.error(f"请求失败: {str(e)}", exc_info=True)

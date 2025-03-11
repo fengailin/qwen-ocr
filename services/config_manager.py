@@ -109,7 +109,8 @@ class ConfigManager:
                 logger.debug("开始保存配置文件...")
                 config = {
                     'base_api_url': self._base_api_url,
-                    'accounts': self._accounts
+                    'accounts': self._accounts,
+                    'common_cookies': self.common_cookies  # 确保保存公共cookie配置
                 }
                 
                 # 先将配置写入临时文件
@@ -117,10 +118,7 @@ class ConfigManager:
                 async with aiofiles.open(temp_file, 'w', encoding='utf-8') as f:
                     await f.write(yaml.safe_dump(config, allow_unicode=True))
                 
-                # 如果写入成功，替换原文件
-                if os.path.exists(self._config_file):
-                    backup_file = f"{self._config_file}.bak"
-                    os.replace(self._config_file, backup_file)
+                # 如果写入成功，直接替换原文件
                 os.replace(temp_file, self._config_file)
                 
                 self._last_load_time = time.time()  # 更新最后加载时间
@@ -147,13 +145,109 @@ class ConfigManager:
                 return account
         return None
 
-    def get_account_by_cookie(self, cookie: str) -> Optional[Dict[str, Any]]:
-        """根据cookie获取账号信息"""
+    @property
+    def common_cookies(self) -> dict:
+        """获取公共 cookie 配置"""
         self._load_config_if_needed()
+        return self._config_cache.get('common_cookies', {})
+
+    def _merge_cookies(self, account_cookie: str) -> str:
+        """
+        合并账号 cookie 和公共 cookie
+        
+        Args:
+            account_cookie: 账号的原始 cookie 字符串
+            
+        Returns:
+            str: 合并后的 cookie 字符串
+        """
+        # 获取公共 cookie
+        common_cookies = self.common_cookies
+        
+        # 如果没有公共 cookie，直接返回账号 cookie
+        if not common_cookies:
+            return account_cookie
+            
+        # 将公共 cookie 转换为字符串形式
+        common_cookie_str = '; '.join([f"{k}={v}" for k, v in common_cookies.items()])
+        
+        # 合并 cookie
+        if account_cookie:
+            return f"{account_cookie}; {common_cookie_str}"
+        return common_cookie_str
+
+    def get_account_by_cookie(self, cookie: str) -> Optional[Dict[str, Any]]:
+        """
+        根据cookie获取账号信息。
+        现在支持包含公共字段的cookie匹配。
+        
+        Args:
+            cookie: cookie字符串
+            
+        Returns:
+            Optional[Dict[str, Any]]: 匹配的账号信息
+        """
+        self._load_config_if_needed()
+        
+        # 如果cookie为空，直接返回None
+        if not cookie:
+            return None
+            
+        # 解析cookie字符串为字典
+        def parse_cookie(cookie_str: str) -> dict:
+            cookie_dict = {}
+            for item in cookie_str.split(';'):
+                item = item.strip()
+                if not item:
+                    continue
+                if '=' in item:
+                    key, value = item.split('=', 1)
+                    cookie_dict[key.strip()] = value.strip()
+            return cookie_dict
+            
+        # 解析输入的cookie
+        input_cookies = parse_cookie(cookie)
+        
+        # 获取公共cookie字段
+        common_cookies = self.common_cookies
+        
         for account in self._accounts:
-            if account.get('cookie') == cookie and account.get('enabled', True):
+            if not account.get('enabled', True):
+                continue
+                
+            account_cookie = account.get('cookie', '')
+            if not account_cookie:
+                continue
+                
+            # 解析账号的cookie
+            account_cookies = parse_cookie(account_cookie)
+            
+            # 检查账号特有的cookie字段是否匹配
+            # 我们只需要检查账号cookie中的关键字段
+            key_fields = {'token', 'SERVERID', 'SERVERCORSID'}
+            match = True
+            for field in key_fields:
+                if field in account_cookies and field in input_cookies:
+                    if account_cookies[field] != input_cookies[field]:
+                        match = False
+                        break
+            
+            if match:
                 return account
+                
         return None
+
+    def get_cookie_with_common_fields(self, account_cookie: str) -> str:
+        """
+        获取包含公共字段的完整 cookie
+        
+        Args:
+            account_cookie: 账号的原始 cookie 字符串
+            
+        Returns:
+            str: 包含公共字段的完整 cookie 字符串
+        """
+        return self._merge_cookies(account_cookie)
 
     async def add_account(self, username: str, password: str = None, cookie: str = None, token: str = None, enabled: bool = True) -> None:
         """添加新账号"""

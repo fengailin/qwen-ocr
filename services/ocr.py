@@ -81,29 +81,37 @@ async def _get_valid_token(cookie: str) -> str:
         
     Returns:
         str: 有效的token
+        
+    Raises:
+        OCRError: 当无法获取有效token时抛出
     """
     config_manager = ConfigManager.get_instance()
     
-    # 从配置中获取账号信息
-    account = config_manager.get_account_by_cookie(cookie)
-    if not account:
-        raise OCRError("无法找到对应的账号信息")
-    
-    # 检查现有token是否有效
-    token = account.get('token')
-    if token and await check_token_validity(token):
-        return token
-        
-    # 如果token无效或不存在，尝试重新登录
     try:
+        # 从配置中获取账号信息
+        account = config_manager.get_account_by_cookie(cookie)
+        if not account:
+            logger.error("无法找到对应的账号信息")
+            logger.debug(f"当前cookie: {cookie}")
+            raise OCRError("无法找到对应的账号信息")
+        
+        # 检查现有token是否有效
+        token = account.get('token')
+        if token and await check_token_validity(token):
+            return token
+            
+        # 如果token无效或不存在，尝试重新登录
         username = account.get('username')
         password = account.get('password')
         if not username or not password:
             raise OCRError("账号信息不完整，无法重新登录")
             
-        new_token, new_cookie, expires_at = await signin(username, password)
+        new_token, new_cookie, expires_at = await signin(username, password, is_password_hashed=True)
         return new_token
+    except OCRError:
+        raise
     except Exception as e:
+        logger.error(f"获取token时发生错误: {str(e)}", exc_info=True)
         raise OCRError(f"获取新token失败: {str(e)}")
 
 async def _upload_image_info(image_bytes: bytes, filename: str, cookie: str) -> dict:
