@@ -33,6 +33,8 @@ class ConfigManager:
     def __init__(self):
         self._base_api_url = 'https://chat.qwen.ai'
         self._accounts = []
+        self._default_model = 'qwen-turbo-latest'
+        self._available_models = ['qwen-turbo-latest']
         self._load_config_if_needed()
 
     @classmethod
@@ -40,6 +42,18 @@ class ConfigManager:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    @property
+    def default_model(self):
+        """获取默认模型名称"""
+        self._load_config_if_needed()
+        return self._default_model
+
+    @property
+    def available_models(self):
+        """获取可用模型列表"""
+        self._load_config_if_needed()
+        return self._available_models
 
     def _should_reload_config(self):
         """检查是否需要重新加载配置"""
@@ -69,6 +83,12 @@ class ConfigManager:
                 self._config_cache = yaml.safe_load(f)
                 self._base_api_url = self._config_cache.get('base_api_url', 'https://chat.qwen.ai')
                 self._accounts = self._config_cache.get('accounts', [])
+                
+                # 加载模型配置
+                model_config = self._config_cache.get('model_config', {})
+                self._default_model = model_config.get('default_model', 'qwen-turbo-latest')
+                self._available_models = model_config.get('available_models', ['qwen-turbo-latest'])
+                
                 # 确保每个账号都有 enabled 字段
                 for account in self._accounts:
                     if 'enabled' not in account:
@@ -79,9 +99,15 @@ class ConfigManager:
             logger.warning(f"配置文件 {self._config_file} 不存在，使用默认配置")
             self._base_api_url = 'https://chat.qwen.ai'
             self._accounts = []
+            self._default_model = 'qwen-turbo-latest'
+            self._available_models = ['qwen-turbo-latest']
             self._config_cache = {
                 'base_api_url': self._base_api_url,
-                'accounts': self._accounts
+                'accounts': self._accounts,
+                'model_config': {
+                    'default_model': self._default_model,
+                    'available_models': self._available_models
+                }
             }
         except Exception as e:
             logger.error(f"加载配置文件时发生错误: {str(e)}", exc_info=True)
@@ -110,7 +136,11 @@ class ConfigManager:
                 config = {
                     'base_api_url': self._base_api_url,
                     'accounts': self._accounts,
-                    'common_cookies': self.common_cookies  # 确保保存公共cookie配置
+                    'common_cookies': self.common_cookies,  # 确保保存公共cookie配置
+                    'model_config': {
+                        'default_model': self._default_model,
+                        'available_models': self._available_models
+                    }
                 }
                 
                 # 先将配置写入临时文件

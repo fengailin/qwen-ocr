@@ -1,4 +1,10 @@
 base_api_url: "https://chat.qwen.ai"
+model_config:
+  default_model: "qwen-turbo-latest"  # 默认使用的模型
+  available_models:  # 可用的模型列表
+    - "qwen-turbo-latest"
+    - "qwen-plus"
+    - "qwen-max"
 accounts:
   - username: "example@email.com"
     password: "your_password_hash"  # 密码的SHA-256哈希值

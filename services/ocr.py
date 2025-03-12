@@ -30,8 +30,8 @@ DEFAULT_PROMPT = (
     "3.独立公式块使用两个$$符号包裹，如：$$\\sum_{i=1}^ni^2$$\n"
     "4.普通文本保持原样，不要使用LaTeX格式\n"
     "5.保持原文的段落格式和换行\n"
-    "6.明显的换行使用\\n表示\n"
-    "7.确保所有数学符号都被正确包裹在$或$$中\n\n"
+    #"6.明显的换行使用\\n表示\n"
+    "6.确保所有数学符号都被正确包裹在$或$$中\n\n"
     "对于验证码图片：\n"
     "1.只输出验证码字符，不要加任何额外解释\n"
     "2.忽略干扰线和噪点\n"
@@ -49,27 +49,81 @@ class OCRError(Exception):
 # 定义泛型类型变量
 T = TypeVar('T')
 
-async def retry_operation(operation: Callable[..., Awaitable[T]], *args, max_retries: int = 3, delay: float = 1.0, **kwargs) -> T:
+async def handle_api_error(e: httpx.HTTPError, operation_name: str) -> None:
+    """统一处理API错误"""
+    error_detail = ""
+    if hasattr(e, 'response') and e.response is not None:
+        try:
+            error_detail = f"\n响应状态码: {e.response.status_code}"
+            error_detail += f"\n响应头: {dict(e.response.headers)}"
+            error_detail += f"\n响应内容: {e.response.text}"
+        except Exception as parse_error:
+            error_detail = f"\n无法解析响应内容: {str(parse_error)}"
+    
+    logger.error(f"{operation_name}失败: {str(e)}{error_detail}")
+    raise OCRError(
+        f"{operation_name}失败: {str(e)}",
+        status_code=e.response.status_code if hasattr(e, 'response') else None,
+        raw_response=e.response.text if hasattr(e, 'response') else None
+    )
+
+async def retry_with_token_refresh(operation: Callable[..., Awaitable[T]], *args, operation_name: str = "操作", **kwargs) -> T:
     """
-    通用的异步重试函数
-    :param operation: 要重试的异步操作
-    :param args: 位置参数
-    :param max_retries: 最大重试次数
-    :param delay: 重试间隔（秒）
-    :param kwargs: 关键字参数
-    :return: 操作结果
+    带token刷新的重试函数
     """
+    max_retries = 3
+    delay = 1.0
     last_exception = None
+    
+    # 检查参数中是否包含cookie
+    cookie = None
+    for arg in args:
+        if isinstance(arg, str) and 'token=' in arg:
+            cookie = arg
+            break
+    if not cookie:
+        for value in kwargs.values():
+            if isinstance(value, str) and 'token=' in value:
+                cookie = value
+                break
+    
+    if not cookie:
+        logger.warning(f"未找到cookie参数，将不会进行token刷新")
+    
     for attempt in range(max_retries):
         try:
             return await operation(*args, **kwargs)
+        except httpx.HTTPError as e:
+            last_exception = e
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401 and cookie:
+                logger.warning(f"遇到401错误，尝试刷新token...")
+                try:
+                    new_token = await _get_valid_token(cookie)
+                    if 'headers' in kwargs:
+                        kwargs['headers']['authorization'] = f"Bearer {new_token}"
+                    logger.info("token已刷新，重试操作...")
+                    continue
+                except Exception as refresh_error:
+                    logger.error(f"刷新token失败: {str(refresh_error)}")
+            
+            if attempt < max_retries - 1:
+                wait_time = delay * (attempt + 1)
+                logger.warning(f"第{attempt + 1}次尝试失败，等待{wait_time}秒后重试...")
+                await asyncio.sleep(wait_time)
+                continue
+            
+            await handle_api_error(e, operation_name)
         except Exception as e:
             last_exception = e
-            logger.warning(f"第{attempt + 1}次尝试失败: {str(e)}")
-            if attempt < max_retries - 1:  # 如果不是最后一次尝试
-                await asyncio.sleep(delay * (attempt + 1))  # 指数退避
-            continue
-    logger.error(f"在{max_retries}次尝试后仍然失败")
+            if attempt < max_retries - 1:
+                wait_time = delay * (attempt + 1)
+                logger.warning(f"第{attempt + 1}次尝试失败: {str(e)}，等待{wait_time}秒后重试...")
+                await asyncio.sleep(wait_time)
+                continue
+            
+            logger.error(f"{operation_name}失败: {str(e)}\n详细信息: {repr(e)}")
+            raise OCRError(f"{operation_name}失败: {str(e)}")
+    
     raise last_exception
 
 async def _get_valid_token(cookie: str) -> str:
@@ -107,12 +161,28 @@ async def _get_valid_token(cookie: str) -> str:
             raise OCRError("账号信息不完整，无法重新登录")
             
         new_token, new_cookie, expires_at = await signin(username, password, is_password_hashed=True)
+        
+        # 更新配置信息
+        logger.info(f"更新账号 {username} 的token和cookie信息")
+        await config_manager.update_account(username, new_token, new_cookie, expires_at)
+        
         return new_token
     except OCRError:
         raise
     except Exception as e:
         logger.error(f"获取token时发生错误: {str(e)}", exc_info=True)
         raise OCRError(f"获取新token失败: {str(e)}")
+
+async def _raw_upload_image(client: httpx.AsyncClient, url: str, headers: Dict[str, str], files: Dict[str, Any]) -> Dict[str, Any]:
+    """执行实际的图片上传请求"""
+    resp = await client.post(url, headers=headers, files=files)
+    resp.raise_for_status()
+    file_info = resp.json()
+    
+    if not file_info.get("id"):
+        raise OCRError("文件上传成功，但未返回有效 id", raw_response=resp.text)
+    
+    return file_info
 
 async def _upload_image_info(image_bytes: bytes, filename: str, cookie: str) -> dict:
     """
@@ -151,37 +221,14 @@ async def _upload_image_info(image_bytes: bytes, filename: str, cookie: str) -> 
         )
     }
     
-    # 设置更长的超时时间和重试次数
     async with httpx.AsyncClient(timeout=120.0) as client:
-        for attempt in range(3):  # 最多重试3次
-            try:
-                resp = await client.post(upload_url, headers=headers, files=files)
-                resp.raise_for_status()
-                file_info = resp.json()
-                logger.debug(f"文件上传响应: {file_info}")
-                
-                if not file_info.get("id"):
-                    raise OCRError("文件上传成功，但未返回有效 id", raw_response=resp.text)
-                    
-                return file_info
-            except httpx.HTTPError as e:
-                logger.warning(f"第{attempt + 1}次上传尝试失败: {str(e)}")
-                if attempt == 2:  # 最后一次尝试失败
-                    raise OCRError(
-                        f"文件上传失败: {str(e)}",
-                        status_code=e.response.status_code if hasattr(e, 'response') else None,
-                        raw_response=e.response.text if hasattr(e, 'response') else None
-                    )
-                await asyncio.sleep(1)  # 等待1秒后重试
-            except Exception as e:
-                logger.error(f"文件上传过程发生未知错误: {str(e)}")
-                raise OCRError(f"文件上传失败: {str(e)}")
+        return await _raw_upload_image(client, upload_url, headers, files)
 
 async def upload_image_info(image_bytes: bytes, filename: str, cookie: str) -> dict:
     """
     带重试的上传图片函数
     """
-    return await retry_operation(_upload_image_info, image_bytes, filename, cookie)
+    return await retry_with_token_refresh(_upload_image_info, image_bytes, filename, cookie, operation_name="文件上传")
 
 async def _create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
     """
@@ -192,6 +239,7 @@ async def _create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
     # 获取有效的token和配置管理器
     token = await _get_valid_token(cookie)
     config_manager = ConfigManager.get_instance()
+    default_model = config_manager.default_model
     
     new_chat_url = f"{config_manager.base_api_url}/api/v1/chats/new"
     user_msg_id = str(uuid.uuid4())
@@ -218,7 +266,7 @@ async def _create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
         "chat": {
             "id": "",
             "title": "新建对话",
-            "models": ["qwen2.5-vl-72b-instruct"],
+            "models": [default_model],
             "params": {},
             "history": {
                 "messages": {
@@ -230,7 +278,7 @@ async def _create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
                         "content": prompt,
                         "files": [file_data],
                         "timestamp": ts,
-                        "models": ["qwen2.5-vl-72b-instruct"],
+                        "models": [default_model],
                         "chat_type": "t2t",
                         "feature_config": {"thinking_enabled": False}
                     },
@@ -240,8 +288,8 @@ async def _create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
                         "childrenIds": [],
                         "role": "assistant",
                         "content": "",
-                        "model": "qwen2.5-vl-72b-instruct",
-                        "modelName": "Qwen2.5-VL-72B-Instruct",
+                        "model": default_model,
+                        "modelName": default_model,
                         "modelIdx": 0,
                         "userContext": None,
                         "timestamp": ts,
@@ -260,7 +308,7 @@ async def _create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
                     "content": prompt,
                     "files": [file_data],
                     "timestamp": ts,
-                    "models": ["qwen2.5-vl-72b-instruct"],
+                    "models": [default_model],
                     "chat_type": "t2t",
                     "feature_config": {"thinking_enabled": False}
                 },
@@ -270,8 +318,8 @@ async def _create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
                     "childrenIds": [],
                     "role": "assistant",
                     "content": "",
-                    "model": "qwen2.5-vl-72b-instruct",
-                    "modelName": "Qwen2.5-VL-72B-Instruct",
+                    "model": default_model,
+                    "modelName": default_model,
                     "modelIdx": 0,
                     "userContext": None,
                     "timestamp": ts,
@@ -343,7 +391,7 @@ async def create_chat(cookie: str, file_info: dict, prompt: str) -> dict:
     """
     带重试的创建对话函数
     """
-    return await retry_operation(_create_chat, cookie, file_info, prompt)
+    return await retry_with_token_refresh(_create_chat, cookie, file_info, prompt, operation_name="创建对话")
 
 async def create_file_info_from_id(file_id: str) -> dict:
     """
@@ -391,7 +439,7 @@ async def _recognize_image(cookie: str, file_info: Union[str, dict], prompt: str
             "stream": True,
             "incremental_output": True,
             "chat_type": "t2t",
-            "model": "qwen2.5-vl-72b-instruct",
+            "model": config_manager.default_model,
             "messages": [
                 {
                     "role": "user",
@@ -443,9 +491,38 @@ async def _recognize_image(cookie: str, file_info: Union[str, dict], prompt: str
                 is_finished = False
                 
                 async with client.stream("POST", recognition_url, headers=headers, json=payload) as response:
+                    # 记录响应状态和头信息
+                    logger.debug(f"响应状态码: {response.status_code}")
+                    logger.debug(f"响应头: {dict(response.headers)}")
+                    
+                    # 如果状态码不是2xx，尝试获取详细的错误信息
+                    if response.status_code >= 400:
+                        error_content = await response.aread()
+                        try:
+                            error_json = json.loads(error_content)
+                            error_detail = f"\n状态码: {response.status_code}"
+                            error_detail += f"\n响应头: {dict(response.headers)}"
+                            error_detail += f"\n错误详情: {json.dumps(error_json, ensure_ascii=False, indent=2)}"
+                            logger.error(f"请求失败，详细信息：{error_detail}")
+                            raise OCRError(
+                                f"识别请求失败: {response.status_code} {response.reason_phrase}",
+                                status_code=response.status_code,
+                                raw_response=error_detail
+                            )
+                        except json.JSONDecodeError:
+                            error_text = error_content.decode('utf-8', errors='replace')
+                            error_detail = f"\n状态码: {response.status_code}"
+                            error_detail += f"\n响应头: {dict(response.headers)}"
+                            error_detail += f"\n响应内容: {error_text}"
+                            logger.error(f"请求失败，详细信息：{error_detail}")
+                            raise OCRError(
+                                f"识别请求失败: {response.status_code} {response.reason_phrase}",
+                                status_code=response.status_code,
+                                raw_response=error_detail
+                            )
+                    
                     response.raise_for_status()
                     logger.debug("开始接收流式响应...")
-                    logger.debug(f"响应头: {response.headers}")
                     has_content = False
                     async for line in response.aiter_lines():
                         if not line:
@@ -498,17 +575,25 @@ async def _recognize_image(cookie: str, file_info: Union[str, dict], prompt: str
                 
             except httpx.HTTPError as e:
                 logger.error(f"识别请求失败: {str(e)}")
-                raw_response = None
+                error_detail = f"\n异常类型: {type(e).__name__}"
                 if hasattr(e, 'response') and e.response is not None:
                     try:
-                        raw_response = e.response.text
-                        logger.error(f"原始响应内容: {raw_response}")
-                    except:
-                        pass
+                        error_detail += f"\n状态码: {e.response.status_code}"
+                        error_detail += f"\n响应头: {dict(e.response.headers)}"
+                        error_content = e.response.text
+                        try:
+                            error_json = json.loads(error_content)
+                            error_detail += f"\n错误详情: {json.dumps(error_json, ensure_ascii=False, indent=2)}"
+                        except json.JSONDecodeError:
+                            error_detail += f"\n响应内容: {error_content}"
+                    except Exception as parse_error:
+                        error_detail += f"\n无法解析响应内容: {str(parse_error)}"
+                
+                logger.error(f"请求失败详细信息：{error_detail}")
                 raise OCRError(
                     f"识别请求失败: {str(e)}",
                     status_code=e.response.status_code if hasattr(e, 'response') else None,
-                    raw_response=raw_response
+                    raw_response=error_detail
                 )
             except json.JSONDecodeError as e:
                 logger.error(f"响应解析失败: {str(e)}")
@@ -527,7 +612,7 @@ async def recognize_image(cookie: str, file_info: Union[str, dict], prompt: str 
     """
     带重试的图片识别函数
     """
-    return await retry_operation(_recognize_image, cookie, file_info, prompt)
+    return await retry_with_token_refresh(_recognize_image, cookie, file_info, prompt, operation_name="图片识别")
 
 async def _process_image_url(image_url: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
     """
@@ -591,7 +676,7 @@ async def process_image_url(image_url: str, cookie: str, prompt: str = DEFAULT_P
     """
     带重试的URL图片处理函数
     """
-    return await retry_operation(_process_image_url, image_url, cookie, prompt)
+    return await retry_with_token_refresh(_process_image_url, image_url, cookie, prompt, operation_name="URL图片处理")
 
 async def _process_base64_image(base64_image: str, cookie: str, prompt: str = DEFAULT_PROMPT) -> dict:
     """
@@ -635,4 +720,4 @@ async def process_base64_image(base64_image: str, cookie: str, prompt: str = DEF
     """
     带重试的Base64图片处理函数
     """
-    return await retry_operation(_process_base64_image, base64_image, cookie, prompt)
+    return await retry_with_token_refresh(_process_base64_image, base64_image, cookie, prompt, operation_name="Base64图片处理")
