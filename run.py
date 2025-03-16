@@ -9,7 +9,7 @@ def main():
     parser = argparse.ArgumentParser(description='启动 QwenLM OCR API 服务')
     parser.add_argument('--host', default='127.0.0.1', help='服务器监听地址')
     parser.add_argument('--port', type=int, default=8000, help='服务器监听端口')
-    parser.add_argument('--reload', action='store_true', default=True, help='是否启用热重载')
+    parser.add_argument('--reload', action='store_true', default=False, help='是否启用热重载')
     parser.add_argument('--workers', type=int, default=1, help='工作进程数')
     
     args = parser.parse_args()
